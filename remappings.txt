@@ -8,5 +8,6 @@ openzeppelin-contracts-upgradeable/=lib/openzeppelin-contracts-upgradeable/contr
 operator-filter-registry/=lib/operator-filter-registry/src/
 seadrop/=src/
 solmate/=lib/solmate/src/
+solady/=lib/solady/src/
 utility-contracts/=lib/utility-contracts/src/
 create2-scripts/=lib/create2-helpers/script/
