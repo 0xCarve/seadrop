@@ -53,6 +53,8 @@ contract CarveGenerative is ERC721SeaDrop {
     using LibPRNG for LibPRNG.PRNG;
 
     event MetadataUpdate(uint256 _tokenId);
+    event ContractSealed();
+    event RevealCommitScheduled(uint256 targetBlockNumber);
 
     error NotAvailable();
     error InvalidInput();
@@ -72,11 +74,13 @@ contract CarveGenerative is ERC721SeaDrop {
 
     uint256 private revealSeed;
     uint256 private numberOfLayers;
+    uint256 private revealBlockNumber;
 
     GenerativeSettings public settings;
+    bool private sealed;
 
     modifier whenUnsealed() {
-        if (_maxSupply > 0 && _totalMinted() >= _maxSupply) {
+        if (sealed) {
             revert NotAuthorized();
         }
         _;
@@ -141,6 +145,18 @@ contract CarveGenerative is ERC721SeaDrop {
 
         // Call parent _mint to actually mint the tokens
         super._mint(to, quantity);
+    }
+
+    function _sealContract() internal {
+        if (sealed) {
+            return;
+        }
+        sealed = true;
+        emit ContractSealed();
+    }
+
+    function sealContract() external onlyOwner {
+        _sealContract();
     }
 
     function selectTrait(uint256 layerIndex, uint256 randomInput)
@@ -208,7 +224,6 @@ contract CarveGenerative is ERC721SeaDrop {
                     block.number,
                     blockhash(block.number - 1),
                     tx.gasprice,
-                    msg.sender,
                     startTokenId
                 )
             )
@@ -598,47 +613,78 @@ contract CarveGenerative is ERC721SeaDrop {
         external
         onlyOwner
     {
-        // Only allow setting placeholder if not yet revealed
-        if (revealSeed == 0 && bytes(placeholderImage).length != 0) {
-            settings.placeholderImage = placeholderImage;
+        if (revealSeed != 0) {
+            revert NotAuthorized();
         }
+        if (bytes(placeholderImage).length == 0) {
+            revert InvalidInput();
+        }
+        settings.placeholderImage = placeholderImage;
     }
 
     function setDescription(string calldata description) external onlyOwner {
         settings.description = description;
     }
 
-    function setRevealSeed() external onlyOwner {
+    function commitReveal() external onlyOwner {
         if (revealSeed != 0) {
             revert NotAuthorized();
         }
-        revealSeed = uint256(
-            keccak256(
-                abi.encodePacked(
-                    tx.gasprice,
-                    block.number,
-                    block.timestamp,
-                    block.difficulty,
-                    blockhash(block.number - 1),
-                    msg.sender
-                )
-            )
-        );
+        if (bytes(settings.placeholderImage).length == 0) {
+            revert InvalidInput();
+        }
+        if (revealBlockNumber != 0) {
+            if (
+                block.number > revealBlockNumber &&
+                block.number <= revealBlockNumber + 256
+            ) {
+                revert NotAuthorized();
+            }
+        }
+
+        revealBlockNumber = block.number + 32;
+
+        emit RevealCommitScheduled(revealBlockNumber);
+    }
+
+    function finalizeReveal() external onlyOwner {
+        if (revealSeed != 0) {
+            revert NotAuthorized();
+        }
+        uint256 targetBlock = revealBlockNumber;
+        if (targetBlock == 0) {
+            revert InvalidInput();
+        }
+        if (block.number <= targetBlock) {
+            revert NotAvailable();
+        }
+
+        bytes32 blockHash = blockhash(targetBlock);
+        if (blockHash == 0) {
+            revert NotAvailable();
+        }
+
+        revealSeed = uint256(blockHash);
+        revealBlockNumber = 0;
 
         emit BatchMetadataUpdate(1, _maxSupply);
     }
 
-    function setTraitOverride(uint256 tokenId, uint256[] calldata traitIndices)
+    function setTraitOverride(
+        uint256 dataId,
+        uint256[] calldata traitIndices,
+        uint256 tokenId
+    )
         external
         onlyOwner
     {
         if (traitIndices.length != numberOfLayers) {
             revert InvalidInput();
         }
-
-        uint256 dataId = getTokenDataId(tokenId);
         traitOverride[dataId] = traitIndices;
 
-        emit MetadataUpdate(tokenId);
+        if (tokenId != 0 && _exists(tokenId)) {
+            emit MetadataUpdate(tokenId);
+        }
     }
 }
