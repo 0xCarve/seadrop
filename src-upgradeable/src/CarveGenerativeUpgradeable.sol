@@ -7,6 +7,7 @@ import { LibPRNG } from "solady/utils/LibPRNG.sol";
 import { Base64 } from "solady/utils/Base64.sol";
 import { SSTORE2 } from "solady/utils/SSTORE2.sol";
 import { DynamicBufferLib } from "solady/utils/DynamicBufferLib.sol";
+import { SafeTransferLib } from "solady/utils/SafeTransferLib.sol";
 
 import {
     CarveGenerativeStorage,
@@ -17,6 +18,9 @@ import {
 import {
     ERC721ContractMetadataStorage
 } from "./ERC721ContractMetadataStorage.sol";
+import { ERC721SeaDropStorage } from "./ERC721SeaDropStorage.sol";
+import { ISeaDropUpgradeable } from "./interfaces/ISeaDropUpgradeable.sol";
+import { PublicDrop } from "./lib/SeaDropStructsUpgradeable.sol";
 
 struct LinkedTraitDTO {
     uint256[] traitA;
@@ -47,11 +51,18 @@ contract CarveGenerativeUpgradeable is ERC721SeaDropUpgradeable {
     using ERC721ContractMetadataStorage for ERC721ContractMetadataStorage.Layout;
 
     event MetadataUpdate(uint256 _tokenId);
+    event ContractSealed();
+    event RevealCommitScheduled(uint256 targetBlockNumber);
+    event CreatorProceedsWithdrawn(address recipient, uint256 amount);
 
     error NotAvailable();
     error InvalidInput();
     error NotAuthorized();
     error InvalidTraitSelection(uint256 layerIndex, uint256 randomInput);
+
+    uint256 private constant COLLECTOR_FEE_PER_TOKEN = 0.000777 ether;
+    address payable internal constant CARVE_FEE_RECIPIENT =
+        payable(0x29FbB84b835F892EBa2D331Af9278b74C595EDf1);
 
     /// @custom:oz-upgrades-unsafe-allow constructor
     constructor() {
@@ -100,15 +111,45 @@ contract CarveGenerativeUpgradeable is ERC721SeaDropUpgradeable {
                 )
             );
         }
+
+        s.carvePayoutAddress = CARVE_FEE_RECIPIENT;
+        _syncCreatorPayoutAddresses();
+    }
+
+    receive() external payable {
+        CarveGenerativeStorage.Layout storage s = CarveGenerativeStorage
+            .layout();
+        uint256 quantity = s.pendingSeaDropQuantity;
+        if (quantity == 0) {
+            revert InvalidInput();
+        }
+
+        s.pendingSeaDropQuantity = 0;
+
+        uint256 cappedFee = COLLECTOR_FEE_PER_TOKEN * quantity;
+        uint256 fee = msg.value > cappedFee ? cappedFee : msg.value;
+        if (fee > 0) {
+            SafeTransferLib.safeTransferETH(CARVE_FEE_RECIPIENT, fee);
+        }
+    }
+
+    function withdrawCreatorProceeds(address payable recipient, uint256 amount)
+        external
+        onlyOwner
+        nonReentrant
+    {
+        if (amount == 0 || amount > address(this).balance) {
+            revert InvalidInput();
+        }
+        if (recipient == address(0)) {
+            recipient = payable(owner());
+        }
+        SafeTransferLib.safeTransferETH(recipient, amount);
+        emit CreatorProceedsWithdrawn(recipient, amount);
     }
 
     modifier whenUnsealed() {
-        CarveGenerativeStorage.Layout storage s = CarveGenerativeStorage
-            .layout();
-        if (
-            ERC721ContractMetadataStorage.layout()._maxSupply > 0 &&
-            _totalMinted() >= ERC721ContractMetadataStorage.layout()._maxSupply
-        ) {
+        if (CarveGenerativeStorage.layout().sealed) {
             revert NotAuthorized();
         }
         _;
@@ -133,6 +174,12 @@ contract CarveGenerativeUpgradeable is ERC721SeaDropUpgradeable {
             );
         }
 
+        CarveGenerativeStorage.Layout storage s = CarveGenerativeStorage
+            .layout();
+        if (s.seaDropMintSender != address(0)) {
+            s.pendingSeaDropQuantity = quantity;
+        }
+
         // Use _nextTokenId() to get the actual starting token ID
         // This accounts for _startTokenId() = 1
         uint256 startTokenId = _nextTokenId();
@@ -143,6 +190,49 @@ contract CarveGenerativeUpgradeable is ERC721SeaDropUpgradeable {
 
         // Call parent _mint to actually mint the tokens
         super._mint(to, quantity);
+    }
+
+    function _sealContract() internal {
+        CarveGenerativeStorage.Layout storage s = CarveGenerativeStorage
+            .layout();
+        if (s.sealed) {
+            return;
+        }
+        s.sealed = true;
+        emit ContractSealed();
+    }
+
+    function sealContract() external onlyOwner {
+        _sealContract();
+    }
+
+    function updateAllowedSeaDrop(address[] calldata allowedSeaDrop)
+        external
+        override
+        onlyOwner
+    {
+        super.updateAllowedSeaDrop(allowedSeaDrop);
+        _syncCreatorPayoutAddresses();
+    }
+
+    function updatePublicDrop(
+        address seaDropImpl,
+        PublicDrop calldata publicDrop
+    ) external override {
+        if (publicDrop.mintPrice < COLLECTOR_FEE_PER_TOKEN) {
+            revert InvalidInput();
+        }
+        super.updatePublicDrop(seaDropImpl, publicDrop);
+    }
+
+    function updateCreatorPayoutAddress(
+        address seaDropImpl,
+        address payoutAddress
+    ) external override {
+        if (payoutAddress != address(this)) {
+            revert InvalidInput();
+        }
+        super.updateCreatorPayoutAddress(seaDropImpl, payoutAddress);
     }
 
     function selectTrait(uint256 layerIndex, uint256 randomInput)
@@ -217,7 +307,6 @@ contract CarveGenerativeUpgradeable is ERC721SeaDropUpgradeable {
                     block.number,
                     blockhash(block.number - 1),
                     tx.gasprice,
-                    msg.sender,
                     startTokenId
                 )
             )
@@ -655,35 +744,63 @@ contract CarveGenerativeUpgradeable is ERC721SeaDropUpgradeable {
     {
         CarveGenerativeStorage.Layout storage s = CarveGenerativeStorage
             .layout();
-        // Only allow setting placeholder if not yet revealed
-        if (s.revealSeed == 0 && bytes(placeholderImage).length != 0) {
-            s.settings.placeholderImage = placeholderImage;
+        if (s.revealSeed != 0) {
+            revert NotAuthorized();
         }
+        if (bytes(placeholderImage).length == 0) {
+            revert InvalidInput();
+        }
+        s.settings.placeholderImage = placeholderImage;
     }
 
     function setDescription(string calldata description) external onlyOwner {
         CarveGenerativeStorage.layout().settings.description = description;
     }
 
-    function setRevealSeed() external onlyOwner {
+    function commitReveal() external onlyOwner {
         CarveGenerativeStorage.Layout storage s = CarveGenerativeStorage
             .layout();
-
         if (s.revealSeed != 0) {
             revert NotAuthorized();
         }
-        s.revealSeed = uint256(
-            keccak256(
-                abi.encodePacked(
-                    tx.gasprice,
-                    block.number,
-                    block.timestamp,
-                    block.difficulty,
-                    blockhash(block.number - 1),
-                    msg.sender
-                )
-            )
-        );
+        if (bytes(s.settings.placeholderImage).length == 0) {
+            revert InvalidInput();
+        }
+        if (s.revealBlockNumber != 0) {
+            if (
+                block.number > s.revealBlockNumber &&
+                block.number <= s.revealBlockNumber + 256
+            ) {
+                revert NotAuthorized();
+            }
+        }
+
+        s.revealBlockNumber = block.number + 32;
+
+        emit RevealCommitScheduled(s.revealBlockNumber);
+    }
+
+    function finalizeReveal() external onlyOwner {
+        CarveGenerativeStorage.Layout storage s = CarveGenerativeStorage
+            .layout();
+        if (s.revealSeed != 0) {
+            revert NotAuthorized();
+        }
+        uint256 targetBlock = s.revealBlockNumber;
+        if (targetBlock == 0) {
+            revert InvalidInput();
+        }
+        if (block.number <= targetBlock) {
+            revert NotAvailable();
+        }
+
+        bytes32 blockHash = blockhash(targetBlock);
+        if (blockHash == 0) {
+            revert NotAvailable();
+        }
+
+        s.revealSeed = uint256(blockHash);
+        s.revealBlockNumber = 0;
 
         emit BatchMetadataUpdate(
             1,
@@ -691,7 +808,11 @@ contract CarveGenerativeUpgradeable is ERC721SeaDropUpgradeable {
         );
     }
 
-    function setTraitOverride(uint256 dataId, uint256[] calldata traitIndices)
+    function setTraitOverride(
+        uint256 dataId,
+        uint256[] calldata traitIndices,
+        uint256 tokenId
+    )
         external
         onlyOwner
     {
@@ -703,12 +824,27 @@ contract CarveGenerativeUpgradeable is ERC721SeaDropUpgradeable {
         }
         s.traitOverride[dataId] = traitIndices;
 
-        // Emit metadata update for any tokens using this dataId
-        // Note: Frontend/indexers need to check which tokenIds map to this dataId
-        emit BatchMetadataUpdate(
-            1,
-            ERC721ContractMetadataStorage.layout()._maxSupply
-        );
+        if (tokenId != 0 && _exists(tokenId)) {
+            emit MetadataUpdate(tokenId);
+        }
+    }
+
+    function _syncCreatorPayoutAddresses() internal {
+        address[] storage allowed = ERC721SeaDropStorage
+            .layout()
+            ._enumeratedAllowedSeaDrop;
+        uint256 length = allowed.length;
+        for (uint256 i = 0; i < length; ) {
+            address seaDrop = allowed[i];
+            if (seaDrop != address(0)) {
+                ISeaDropUpgradeable(seaDrop).updateCreatorPayoutAddress(
+                    address(this)
+                );
+            }
+            unchecked {
+                ++i;
+            }
+        }
     }
 
     function settings() external view returns (GenerativeSettings memory) {

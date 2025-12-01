@@ -34,6 +34,11 @@ library CarveGenerativeStorage {
         uint256 revealSeed;
         uint256 numberOfLayers;
         GenerativeSettings settings;
+        uint256 revealBlockNumber;
+        bool sealed;
+        uint256 pendingSeaDropQuantity;
+        address carvePayoutAddress;
+        address seaDropMintSender;
     }
 
     bytes32 internal constant STORAGE_SLOT =

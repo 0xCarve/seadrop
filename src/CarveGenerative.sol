@@ -7,6 +7,10 @@ import { LibPRNG } from "solady/utils/LibPRNG.sol";
 import { Base64 } from "solady/utils/Base64.sol";
 import { SSTORE2 } from "solady/utils/SSTORE2.sol";
 import { DynamicBufferLib } from "solady/utils/DynamicBufferLib.sol";
+import { SafeTransferLib } from "solady/utils/SafeTransferLib.sol";
+
+import { ISeaDrop } from "./interfaces/ISeaDrop.sol";
+import { PublicDrop } from "./lib/SeaDropStructs.sol";
 
 struct LinkedTraitDTO {
     uint256[] traitA;
@@ -55,6 +59,7 @@ contract CarveGenerative is ERC721SeaDrop {
     event MetadataUpdate(uint256 _tokenId);
     event ContractSealed();
     event RevealCommitScheduled(uint256 targetBlockNumber);
+    event CreatorProceedsWithdrawn(address recipient, uint256 amount);
 
     error NotAvailable();
     error InvalidInput();
@@ -79,11 +84,46 @@ contract CarveGenerative is ERC721SeaDrop {
     GenerativeSettings public settings;
     bool private sealed;
 
+    uint256 private constant COLLECTOR_FEE_PER_TOKEN = 0.000777 ether;
+    address payable private constant CARVE_FEE_RECIPIENT =
+        payable(0x29FbB84b835F892EBa2D331Af9278b74C595EDf1);
+    uint256 private pendingSeaDropQuantity;
+
     modifier whenUnsealed() {
         if (sealed) {
             revert NotAuthorized();
         }
         _;
+    }
+
+    receive() external payable {
+        uint256 quantity = pendingSeaDropQuantity;
+        if (quantity == 0) {
+            revert InvalidInput();
+        }
+
+        pendingSeaDropQuantity = 0;
+
+        uint256 cappedFee = COLLECTOR_FEE_PER_TOKEN * quantity;
+        uint256 fee = msg.value > cappedFee ? cappedFee : msg.value;
+        if (fee > 0) {
+            SafeTransferLib.safeTransferETH(CARVE_FEE_RECIPIENT, fee);
+        }
+    }
+
+    function withdrawCreatorProceeds(address payable recipient, uint256 amount)
+        external
+        onlyOwner
+        nonReentrant
+    {
+        if (amount == 0 || amount > address(this).balance) {
+            revert InvalidInput();
+        }
+        if (recipient == address(0)) {
+            recipient = payable(owner());
+        }
+        SafeTransferLib.safeTransferETH(recipient, amount);
+        emit CreatorProceedsWithdrawn(recipient, amount);
     }
 
     /**
@@ -115,6 +155,8 @@ contract CarveGenerative is ERC721SeaDrop {
                 )
             );
         }
+
+        _syncCreatorPayoutAddresses();
     }
 
     /**
@@ -134,6 +176,8 @@ contract CarveGenerative is ERC721SeaDrop {
                 _maxSupply
             );
         }
+
+        pendingSeaDropQuantity = quantity;
 
         // Use _nextTokenId() to get the actual starting token ID
         // This accounts for _startTokenId() = 1
@@ -157,6 +201,35 @@ contract CarveGenerative is ERC721SeaDrop {
 
     function sealContract() external onlyOwner {
         _sealContract();
+    }
+
+    function updateAllowedSeaDrop(address[] calldata allowedSeaDrop)
+        external
+        override
+        onlyOwner
+    {
+        super.updateAllowedSeaDrop(allowedSeaDrop);
+        _syncCreatorPayoutAddresses();
+    }
+
+    function updatePublicDrop(
+        address seaDropImpl,
+        PublicDrop calldata publicDrop
+    ) external override {
+        if (publicDrop.mintPrice < COLLECTOR_FEE_PER_TOKEN) {
+            revert InvalidInput();
+        }
+        super.updatePublicDrop(seaDropImpl, publicDrop);
+    }
+
+    function updateCreatorPayoutAddress(
+        address seaDropImpl,
+        address payoutAddress
+    ) external override {
+        if (payoutAddress != address(this)) {
+            revert InvalidInput();
+        }
+        super.updateCreatorPayoutAddress(seaDropImpl, payoutAddress);
     }
 
     function selectTrait(uint256 layerIndex, uint256 randomInput)
@@ -685,6 +758,19 @@ contract CarveGenerative is ERC721SeaDrop {
 
         if (tokenId != 0 && _exists(tokenId)) {
             emit MetadataUpdate(tokenId);
+        }
+    }
+
+    function _syncCreatorPayoutAddresses() internal {
+        uint256 length = _enumeratedAllowedSeaDrop.length;
+        for (uint256 i = 0; i < length; ) {
+            address seaDrop = _enumeratedAllowedSeaDrop[i];
+            if (seaDrop != address(0)) {
+                ISeaDrop(seaDrop).updateCreatorPayoutAddress(address(this));
+            }
+            unchecked {
+                ++i;
+            }
         }
     }
 }
