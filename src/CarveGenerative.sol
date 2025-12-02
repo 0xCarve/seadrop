@@ -3,48 +3,11 @@ pragma solidity 0.8.17;
 
 import { ERC721SeaDrop } from "./ERC721SeaDrop.sol";
 
-import { LibPRNG } from "solady/utils/LibPRNG.sol";
-import { Base64 } from "solady/utils/Base64.sol";
-import { SSTORE2 } from "solady/utils/SSTORE2.sol";
-import { DynamicBufferLib } from "solady/utils/DynamicBufferLib.sol";
 import { SafeTransferLib } from "solady/utils/SafeTransferLib.sol";
 
 import { ISeaDrop } from "./interfaces/ISeaDrop.sol";
 import { PublicDrop } from "./lib/SeaDropStructs.sol";
-
-struct LinkedTraitDTO {
-    uint256[] traitA;
-    uint256[] traitB;
-}
-
-struct TraitDTO {
-    string name;
-    string mimetype;
-    uint256 occurrence;
-    bytes data;
-    bool hide;
-    bool useExistingData;
-    uint256 existingDataIndex;
-}
-
-struct Trait {
-    string name;
-    string mimetype;
-    uint256 occurrence;
-    address dataPointer;
-    bool hide;
-}
-
-struct Layer {
-    string name;
-    uint256 primeNumber;
-    uint256 numberOfTraits;
-}
-
-struct GenerativeSettings {
-    string description;
-    string placeholderImage;
-}
+import { CarveRenderer, GenerativeSettings, TraitDTO, LinkedTraitDTO, Trait, Layer } from "./CarveRenderer.sol";
 
 /**
  * @title  CarveGenerative
@@ -53,9 +16,6 @@ struct GenerativeSettings {
  *         Minting is handled entirely through SeaDrop.
  */
 contract CarveGenerative is ERC721SeaDrop {
-    using DynamicBufferLib for DynamicBufferLib.DynamicBuffer;
-    using LibPRNG for LibPRNG.PRNG;
-
     event MetadataUpdate(uint256 _tokenId);
     event ContractSealed();
     event RevealCommitScheduled(uint256 targetBlockNumber);
@@ -64,33 +24,17 @@ contract CarveGenerative is ERC721SeaDrop {
     error NotAvailable();
     error InvalidInput();
     error NotAuthorized();
-    error InvalidTraitSelection(uint256 layerIndex, uint256 randomInput);
 
-    mapping(uint256 => Layer) private layers;
-    mapping(uint256 => mapping(uint256 => Trait)) private traits;
-    mapping(uint256 => mapping(uint256 => uint256[])) private linkedTraits;
-    mapping(uint256 => bool) private renderTokenOffChain;
-    mapping(uint256 => uint256[]) private traitOverride;
-
-    // Fisher-Yates storage for mint-time randomness
-    mapping(uint256 => uint256) private tokenDataIds;
-    mapping(uint256 => uint256) private _availableDataIds;
-    uint256 private remainingDataIds;
-
-    uint256 private revealSeed;
-    uint256 private numberOfLayers;
-    uint256 private revealBlockNumber;
-
-    GenerativeSettings public settings;
-    bool private sealed;
+    bool private _sealed;
 
     uint256 private constant COLLECTOR_FEE_PER_TOKEN = 0.000777 ether;
     address payable private constant CARVE_FEE_RECIPIENT =
         payable(0x29FbB84b835F892EBa2D331Af9278b74C595EDf1);
     uint256 private pendingSeaDropQuantity;
+    CarveRenderer public renderer;
 
     modifier whenUnsealed() {
-        if (sealed) {
+        if (_sealed) {
             revert NotAuthorized();
         }
         _;
@@ -134,29 +78,12 @@ contract CarveGenerative is ERC721SeaDrop {
         string memory name,
         string memory symbol,
         address[] memory allowedSeaDrop,
-        GenerativeSettings memory _settings,
-        uint256 _maxSupply
+        GenerativeSettings memory _settings
     ) ERC721SeaDrop(name, symbol, allowedSeaDrop) {
-        settings = _settings;
+        _setMaxSupplyInternal(_settings.maxSupply);
+        _lockMaxSupply();
 
-        // Initialize Fisher-Yates dataId pool
-        remainingDataIds = _maxSupply;
-
-        // Auto-reveal if no placeholder is set (immediate reveal mode)
-        if (bytes(_settings.placeholderImage).length == 0) {
-            revealSeed = uint256(
-                keccak256(
-                    abi.encodePacked(
-                        block.timestamp,
-                        block.number,
-                        block.difficulty,
-                        tx.gasprice
-                    )
-                )
-            );
-        }
-
-        _syncCreatorPayoutAddresses();
+        renderer = new CarveRenderer(_settings);
     }
 
     /**
@@ -185,31 +112,18 @@ contract CarveGenerative is ERC721SeaDrop {
 
         // Always assign random dataIds at mint time using Fisher-Yates
         // Even in delayed reveal, we store them - reveal just adds rotation offset
-        assignRandomDataIds(quantity, startTokenId);
+        renderer.assignRandomDataIds(quantity, startTokenId);
 
         // Call parent _mint to actually mint the tokens
         super._mint(to, quantity);
     }
 
-    function _sealContract() internal {
-        if (sealed) {
+    function sealContract() external onlyOwner {
+        if (_sealed) {
             return;
         }
-        sealed = true;
+        _sealed = true;
         emit ContractSealed();
-    }
-
-    function sealContract() external onlyOwner {
-        _sealContract();
-    }
-
-    function updateAllowedSeaDrop(address[] calldata allowedSeaDrop)
-        external
-        override
-        onlyOwner
-    {
-        super.updateAllowedSeaDrop(allowedSeaDrop);
-        _syncCreatorPayoutAddresses();
     }
 
     function updatePublicDrop(
@@ -219,103 +133,18 @@ contract CarveGenerative is ERC721SeaDrop {
         if (publicDrop.mintPrice < COLLECTOR_FEE_PER_TOKEN) {
             revert InvalidInput();
         }
-        super.updatePublicDrop(seaDropImpl, publicDrop);
+        _onlyOwnerOrSelf();
+        _onlyAllowedSeaDrop(seaDropImpl);
+        ISeaDrop(seaDropImpl).updatePublicDrop(publicDrop);
     }
 
     function updateCreatorPayoutAddress(
         address seaDropImpl,
-        address payoutAddress
+        address /* payoutAddress */
     ) external override {
-        if (payoutAddress != address(this)) {
-            revert InvalidInput();
-        }
-        super.updateCreatorPayoutAddress(seaDropImpl, payoutAddress);
-    }
-
-    function selectTrait(uint256 layerIndex, uint256 randomInput)
-        internal
-        view
-        returns (uint256)
-    {
-        uint256 currentLowerBound = 0;
-        for (uint256 i = 0; i < layers[layerIndex].numberOfTraits; ) {
-            uint256 thisPercentage = traits[layerIndex][i].occurrence;
-            if (
-                randomInput >= currentLowerBound &&
-                randomInput < currentLowerBound + thisPercentage
-            ) return i;
-            currentLowerBound = currentLowerBound + thisPercentage;
-            unchecked {
-                ++i;
-            }
-        }
-
-        revert InvalidTraitSelection(layerIndex, randomInput);
-    }
-
-    /**
-     * @notice Gas-efficient Fisher-Yates: gets and removes a dataId from the pool
-     * @dev Only stores swapped values, not the entire array
-     */
-    function getAvailableDataIdAtIndex(
-        uint256 indexToUse,
-        uint256 currentArraySize
-    ) private returns (uint256 result) {
-        uint256 valAtIndex = _availableDataIds[indexToUse];
-        uint256 lastIndex = currentArraySize - 1;
-        uint256 lastValInArray = _availableDataIds[lastIndex];
-
-        // Return actual value or index if unset (virtual array)
-        result = valAtIndex == 0 ? indexToUse : valAtIndex;
-
-        // Swap with last element (Fisher-Yates)
-        if (indexToUse != lastIndex) {
-            _availableDataIds[indexToUse] = lastValInArray == 0
-                ? lastIndex
-                : lastValInArray;
-        }
-
-        // Clean up last element if it was swapped
-        if (lastValInArray != 0) {
-            delete _availableDataIds[lastIndex];
-        }
-    }
-
-    /**
-     * @notice Assigns random dataIds to tokens at mint time using Fisher-Yates
-     * @dev Called by mintSeaDrop to assign dataIds before minting
-     */
-    function assignRandomDataIds(uint256 quantity, uint256 startTokenId)
-        private
-    {
-        // Generate pseudo-random entropy for this batch
-        uint256 batchEntropy = uint256(
-            keccak256(
-                abi.encodePacked(
-                    block.timestamp,
-                    block.difficulty,
-                    block.number,
-                    blockhash(block.number - 1),
-                    tx.gasprice,
-                    startTokenId
-                )
-            )
-        );
-
-        LibPRNG.PRNG memory prng = LibPRNG.PRNG(batchEntropy);
-
-        // Fisher-Yates: pick random dataId from remaining pool for each token
-        for (uint256 i = 0; i < quantity; i++) {
-            uint256 currentSize = remainingDataIds - i;
-            uint256 randomIndex = prng.uniform(currentSize);
-            uint256 dataId = getAvailableDataIdAtIndex(
-                randomIndex,
-                currentSize
-            );
-            tokenDataIds[startTokenId + i] = dataId;
-        }
-
-        remainingDataIds -= quantity;
+        _onlyOwnerOrSelf();
+        _onlyAllowedSeaDrop(seaDropImpl);
+        ISeaDrop(seaDropImpl).updateCreatorPayoutAddress(address(this));
     }
 
     /**
@@ -327,23 +156,7 @@ contract CarveGenerative is ERC721SeaDrop {
             revert NotAvailable();
         }
 
-        // Get the stored dataId from mint time (Fisher-Yates assigned)
-        uint256 storedDataId = tokenDataIds[tokenId];
-
-        // Check if using immediate reveal or delayed reveal
-        if (bytes(settings.placeholderImage).length == 0) {
-            // Immediate reveal: use stored dataId as-is
-            return storedDataId;
-        } else {
-            // Delayed reveal: apply rotation offset once revealed
-            if (revealSeed == 0) {
-                revert NotAvailable();
-            }
-
-            // Rotate all dataIds by revealSeed
-            // This shifts everyone equally, maintaining Fisher-Yates randomness
-            return (storedDataId + revealSeed) % _maxSupply;
-        }
+        return renderer.getTokenDataId(tokenId);
     }
 
     /**
@@ -355,142 +168,7 @@ contract CarveGenerative is ERC721SeaDrop {
         view
         returns (uint256[] memory)
     {
-        if (revealSeed == 0) {
-            revert NotAvailable();
-        }
-
-        // Check for trait override first
-        if (traitOverride[dataId].length > 0) {
-            return traitOverride[dataId];
-        }
-
-        uint256[] memory traitIndices = new uint256[](numberOfLayers);
-        bool[] memory modifiedLayers = new bool[](numberOfLayers);
-        uint256 traitSeed = revealSeed % _maxSupply;
-
-        for (uint256 i = 0; i < numberOfLayers; ) {
-            if (modifiedLayers[i] == false) {
-                uint256 traitRangePosition = ((dataId + i + traitSeed) *
-                    layers[i].primeNumber) % _maxSupply;
-                traitIndices[i] = selectTrait(i, traitRangePosition);
-            }
-
-            uint256 traitIndex = traitIndices[i];
-            if (linkedTraits[i][traitIndex].length > 0) {
-                uint256 linkedLayer = linkedTraits[i][traitIndex][0];
-                traitIndices[linkedLayer] = linkedTraits[i][traitIndex][1];
-                modifiedLayers[linkedLayer] = true;
-            }
-            unchecked {
-                ++i;
-            }
-        }
-
-        return traitIndices;
-    }
-
-    /**
-     * @notice Generate SVG from trait indices
-     * @dev Works directly with uint256[] - no string parsing!
-     */
-    function traitsToSVG(uint256[] memory traitIndices)
-        internal
-        view
-        returns (string memory)
-    {
-        DynamicBufferLib.DynamicBuffer memory svgBuffer;
-        svgBuffer.reserve(1024 * 64); // Pre-allocate 64KB
-
-        svgBuffer.p(
-            '<svg width="1200" height="1200" viewBox="0 0 1200 1200" version="1.2" xmlns="http://www.w3.org/2000/svg" style="background-image:url('
-        );
-
-        for (uint256 i = 0; i < numberOfLayers - 1; ) {
-            uint256 thisTraitIndex = traitIndices[i];
-            svgBuffer.p(
-                abi.encodePacked(
-                    "data:",
-                    traits[i][thisTraitIndex].mimetype,
-                    ";base64,",
-                    Base64.encode(
-                        SSTORE2.read(traits[i][thisTraitIndex].dataPointer)
-                    ),
-                    "),url("
-                )
-            );
-            unchecked {
-                ++i;
-            }
-        }
-
-        uint256 lastTraitIndex = traitIndices[numberOfLayers - 1];
-        svgBuffer.p(
-            abi.encodePacked(
-                "data:",
-                traits[numberOfLayers - 1][lastTraitIndex].mimetype,
-                ";base64,",
-                Base64.encode(
-                    SSTORE2.read(
-                        traits[numberOfLayers - 1][lastTraitIndex].dataPointer
-                    )
-                ),
-                ');background-repeat:no-repeat;background-size:contain;background-position:center;image-rendering:-webkit-optimize-contrast;-ms-interpolation-mode:nearest-neighbor;image-rendering:-moz-crisp-edges;image-rendering:pixelated;"></svg>'
-            )
-        );
-
-        return
-            string(
-                abi.encodePacked(
-                    "data:image/svg+xml;base64,",
-                    Base64.encode(svgBuffer.data)
-                )
-            );
-    }
-
-    /**
-     * @notice Generate metadata attributes from trait indices
-     * @dev Works directly with uint256[] - no string parsing!
-     */
-    function traitsToMetadata(uint256[] memory traitIndices)
-        internal
-        view
-        returns (string memory)
-    {
-        DynamicBufferLib.DynamicBuffer memory metadataBuffer;
-        metadataBuffer.reserve(1024 * 8); // Pre-allocate 8KB
-        metadataBuffer.p("[");
-        bool afterFirstTrait;
-
-        for (uint256 i = 0; i < numberOfLayers; ) {
-            uint256 thisTraitIndex = traitIndices[i];
-            if (traits[i][thisTraitIndex].hide == false) {
-                if (afterFirstTrait) {
-                    metadataBuffer.p(",");
-                }
-                metadataBuffer.p(
-                    abi.encodePacked(
-                        '{"trait_type":"',
-                        layers[i].name,
-                        '","value":"',
-                        traits[i][thisTraitIndex].name,
-                        '"}'
-                    )
-                );
-                if (afterFirstTrait == false) {
-                    afterFirstTrait = true;
-                }
-            }
-
-            if (i == numberOfLayers - 1) {
-                metadataBuffer.p("]");
-            }
-
-            unchecked {
-                ++i;
-            }
-        }
-
-        return string(metadataBuffer.data);
+        return renderer.dataIdToTraits(dataId);
     }
 
     function tokenURI(uint256 tokenId)
@@ -503,69 +181,7 @@ contract CarveGenerative is ERC721SeaDrop {
             revert InvalidInput();
         }
 
-        DynamicBufferLib.DynamicBuffer memory jsonBuffer;
-
-        jsonBuffer.p(
-            abi.encodePacked(
-                '{"name":"',
-                name(),
-                " #",
-                _toString(tokenId),
-                '","description":"',
-                settings.description,
-                '",'
-            )
-        );
-
-        if (revealSeed == 0) {
-            jsonBuffer.p(
-                abi.encodePacked('"image":"', settings.placeholderImage, '"}')
-            );
-        } else {
-            // Get traits directly - no string conversion needed!
-            uint256[] memory traitIndices = dataIdToTraits(
-                getTokenDataId(tokenId)
-            );
-
-            if (
-                bytes(_tokenBaseURI).length > 0 && renderTokenOffChain[tokenId]
-            ) {
-                // Off-chain rendering URL
-                // External renderer can call dataIdToTraits(getTokenDataId(tokenId)) to get traits
-                jsonBuffer.p(
-                    abi.encodePacked(
-                        '"image":"',
-                        _tokenBaseURI,
-                        _toString(tokenId),
-                        "?chainId=",
-                        _toString(block.chainid),
-                        '",'
-                    )
-                );
-            } else {
-                // On-chain rendering - use traits directly, no parsing!
-                string memory svgCode = traitsToSVG(traitIndices);
-
-                jsonBuffer.p(abi.encodePacked('"image":"', svgCode, '",'));
-            }
-
-            // Use traits directly for metadata - no parsing!
-            jsonBuffer.p(
-                abi.encodePacked(
-                    '"attributes":',
-                    traitsToMetadata(traitIndices),
-                    "}"
-                )
-            );
-        }
-
-        return
-            string(
-                abi.encodePacked(
-                    "data:application/json;base64,",
-                    Base64.encode(jsonBuffer.data)
-                )
-            );
+        return renderer.tokenURI(name(), tokenId, _tokenBaseURI);
     }
 
     function didMintEnd() public view returns (bool) {
@@ -573,15 +189,15 @@ contract CarveGenerative is ERC721SeaDrop {
     }
 
     function isRevealed() public view returns (bool) {
-        return revealSeed != 0;
+        return renderer.isRevealed();
     }
 
     function tokenIdToSVG(uint256 tokenId) public view returns (string memory) {
-        if (revealSeed == 0) {
-            return settings.placeholderImage;
+        if (!_exists(tokenId)) {
+            revert NotAvailable();
         }
-        // Use traits directly - no string conversion!
-        return traitsToSVG(dataIdToTraits(getTokenDataId(tokenId)));
+
+        return renderer.tokenIdToSVG(tokenId);
     }
 
     function traitDetails(uint256 layerIndex, uint256 traitIndex)
@@ -589,7 +205,7 @@ contract CarveGenerative is ERC721SeaDrop {
         view
         returns (Trait memory)
     {
-        return traits[layerIndex][traitIndex];
+        return renderer.traitDetails(layerIndex, traitIndex);
     }
 
     function traitData(uint256 layerIndex, uint256 traitIndex)
@@ -597,7 +213,7 @@ contract CarveGenerative is ERC721SeaDrop {
         view
         returns (bytes memory)
     {
-        return SSTORE2.read(traits[layerIndex][traitIndex].dataPointer);
+        return renderer.traitData(layerIndex, traitIndex);
     }
 
     function getLinkedTraits(uint256 layerIndex, uint256 traitIndex)
@@ -605,7 +221,7 @@ contract CarveGenerative is ERC721SeaDrop {
         view
         returns (uint256[] memory)
     {
-        return linkedTraits[layerIndex][traitIndex];
+        return renderer.getLinkedTraits(layerIndex, traitIndex);
     }
 
     function addLayer(
@@ -615,27 +231,7 @@ contract CarveGenerative is ERC721SeaDrop {
         TraitDTO[] calldata _traits,
         uint256 _numberOfLayers
     ) public onlyOwner whenUnsealed {
-        layers[index] = Layer(name, primeNumber, _traits.length);
-        numberOfLayers = _numberOfLayers;
-        for (uint256 i = 0; i < _traits.length; ) {
-            address dataPointer;
-            if (_traits[i].useExistingData) {
-                dataPointer = traits[index][_traits[i].existingDataIndex]
-                    .dataPointer;
-            } else {
-                dataPointer = SSTORE2.write(_traits[i].data);
-            }
-            traits[index][i] = Trait(
-                _traits[i].name,
-                _traits[i].mimetype,
-                _traits[i].occurrence,
-                dataPointer,
-                _traits[i].hide
-            );
-            unchecked {
-                ++i;
-            }
-        }
+        renderer.addLayer(index, name, primeNumber, _traits, _numberOfLayers);
     }
 
     function addTrait(
@@ -643,19 +239,7 @@ contract CarveGenerative is ERC721SeaDrop {
         uint256 traitIndex,
         TraitDTO calldata _trait
     ) public onlyOwner whenUnsealed {
-        address dataPointer;
-        if (_trait.useExistingData) {
-            dataPointer = traits[layerIndex][traitIndex].dataPointer;
-        } else {
-            dataPointer = SSTORE2.write(_trait.data);
-        }
-        traits[layerIndex][traitIndex] = Trait(
-            _trait.name,
-            _trait.mimetype,
-            _trait.occurrence,
-            dataPointer,
-            _trait.hide
-        );
+        renderer.addTrait(layerIndex, traitIndex, _trait);
     }
 
     function setLinkedTraits(LinkedTraitDTO[] calldata _linkedTraits)
@@ -663,21 +247,14 @@ contract CarveGenerative is ERC721SeaDrop {
         onlyOwner
         whenUnsealed
     {
-        for (uint256 i = 0; i < _linkedTraits.length; ) {
-            linkedTraits[_linkedTraits[i].traitA[0]][
-                _linkedTraits[i].traitA[1]
-            ] = [_linkedTraits[i].traitB[0], _linkedTraits[i].traitB[1]];
-            unchecked {
-                ++i;
-            }
-        }
+        renderer.setLinkedTraits(_linkedTraits);
     }
 
     function setRenderOfTokenId(uint256 tokenId, bool renderOffChain) external {
         if (msg.sender != ownerOf(tokenId)) {
             revert NotAuthorized();
         }
-        renderTokenOffChain[tokenId] = renderOffChain;
+        renderer.setRenderOfTokenId(tokenId, renderOffChain);
 
         emit MetadataUpdate(tokenId);
     }
@@ -686,59 +263,21 @@ contract CarveGenerative is ERC721SeaDrop {
         external
         onlyOwner
     {
-        if (revealSeed != 0) {
-            revert NotAuthorized();
-        }
-        if (bytes(placeholderImage).length == 0) {
-            revert InvalidInput();
-        }
-        settings.placeholderImage = placeholderImage;
+        renderer.setPlaceholderImage(placeholderImage);
     }
 
     function setDescription(string calldata description) external onlyOwner {
-        settings.description = description;
+        renderer.setDescription(description);
     }
 
     function commitReveal() external onlyOwner {
-        if (revealSeed != 0) {
-            revert NotAuthorized();
-        }
-        if (bytes(settings.placeholderImage).length == 0) {
-            revert InvalidInput();
-        }
-        if (revealBlockNumber != 0) {
-            if (
-                block.number > revealBlockNumber &&
-                block.number <= revealBlockNumber + 256
-            ) {
-                revert NotAuthorized();
-            }
-        }
+        renderer.commitReveal();
 
-        revealBlockNumber = block.number + 32;
-
-        emit RevealCommitScheduled(revealBlockNumber);
+        emit RevealCommitScheduled(block.number + 32);
     }
 
     function finalizeReveal() external onlyOwner {
-        if (revealSeed != 0) {
-            revert NotAuthorized();
-        }
-        uint256 targetBlock = revealBlockNumber;
-        if (targetBlock == 0) {
-            revert InvalidInput();
-        }
-        if (block.number <= targetBlock) {
-            revert NotAvailable();
-        }
-
-        bytes32 blockHash = blockhash(targetBlock);
-        if (blockHash == 0) {
-            revert NotAvailable();
-        }
-
-        revealSeed = uint256(blockHash);
-        revealBlockNumber = 0;
+        renderer.finalizeReveal();
 
         emit BatchMetadataUpdate(1, _maxSupply);
     }
@@ -751,26 +290,10 @@ contract CarveGenerative is ERC721SeaDrop {
         external
         onlyOwner
     {
-        if (traitIndices.length != numberOfLayers) {
-            revert InvalidInput();
-        }
-        traitOverride[dataId] = traitIndices;
+        renderer.setTraitOverride(dataId, traitIndices);
 
         if (tokenId != 0 && _exists(tokenId)) {
             emit MetadataUpdate(tokenId);
-        }
-    }
-
-    function _syncCreatorPayoutAddresses() internal {
-        uint256 length = _enumeratedAllowedSeaDrop.length;
-        for (uint256 i = 0; i < length; ) {
-            address seaDrop = _enumeratedAllowedSeaDrop[i];
-            if (seaDrop != address(0)) {
-                ISeaDrop(seaDrop).updateCreatorPayoutAddress(address(this));
-            }
-            unchecked {
-                ++i;
-            }
         }
     }
 }

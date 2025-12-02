@@ -14,6 +14,7 @@ library ERC721ContractMetadataStorage {
     struct Layout {
         /// @notice Track the max supply.
         uint256 _maxSupply;
+        bool _maxSupplyLocked;
         /// @notice Track the base URI for token metadata.
         string _tokenBaseURI;
         /// @notice Track the contract URI for contract metadata.

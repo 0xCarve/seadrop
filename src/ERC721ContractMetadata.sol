@@ -42,6 +42,7 @@ contract ERC721ContractMetadata is
 {
     /// @notice Track the max supply.
     uint256 _maxSupply;
+    bool private _maxSupplyLocked;
 
     /// @notice Track the base URI for token metadata.
     string _tokenBaseURI;
@@ -129,6 +130,8 @@ contract ERC721ContractMetadata is
         emit BatchMetadataUpdate(fromTokenId, toTokenId);
     }
 
+    error MaxSupplyLocked();
+
     /**
      * @notice Sets the max token supply and emits an event.
      *
@@ -138,12 +141,18 @@ contract ERC721ContractMetadata is
         // Ensure the sender is only the owner or contract itself.
         _onlyOwnerOrSelf();
 
-        // Ensure the max supply does not exceed the maximum value of uint64.
+        if (_maxSupplyLocked) {
+            return;
+        }
+
+        _setMaxSupplyInternal(newMaxSupply);
+    }
+
+    function _setMaxSupplyInternal(uint256 newMaxSupply) internal {
         if (newMaxSupply > 2**64 - 1) {
             revert CannotExceedMaxSupplyOfUint64(newMaxSupply);
         }
 
-        // Ensure the max supply does not exceed the total minted.
         if (newMaxSupply < _totalMinted()) {
             revert NewMaxSupplyCannotBeLessThenTotalMinted(
                 newMaxSupply,
@@ -151,11 +160,12 @@ contract ERC721ContractMetadata is
             );
         }
 
-        // Set the new max supply.
         _maxSupply = newMaxSupply;
-
-        // Emit an event with the update.
         emit MaxSupplyUpdated(newMaxSupply);
+    }
+
+    function _lockMaxSupply() internal {
+        _maxSupplyLocked = true;
     }
 
     /**

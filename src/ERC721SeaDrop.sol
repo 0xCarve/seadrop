@@ -346,7 +346,7 @@ contract ERC721SeaDrop is
     function updateCreatorPayoutAddress(
         address seaDropImpl,
         address payoutAddress
-    ) external {
+    ) external virtual {
         // Ensure the sender is only the owner or contract itself.
         _onlyOwnerOrSelf();
 

@@ -132,6 +132,8 @@ contract ERC721ContractMetadataUpgradeable is
         emit BatchMetadataUpdate(fromTokenId, toTokenId);
     }
 
+    error MaxSupplyLocked();
+
     /**
      * @notice Sets the max token supply and emits an event.
      *
@@ -141,24 +143,11 @@ contract ERC721ContractMetadataUpgradeable is
         // Ensure the sender is only the owner or contract itself.
         _onlyOwnerOrSelf();
 
-        // Ensure the max supply does not exceed the maximum value of uint64.
-        if (newMaxSupply > 2**64 - 1) {
-            revert CannotExceedMaxSupplyOfUint64(newMaxSupply);
+        if (ERC721ContractMetadataStorage.layout()._maxSupplyLocked) {
+            return;
         }
 
-        // Ensure the max supply does not exceed the total minted.
-        if (newMaxSupply < _totalMinted()) {
-            revert NewMaxSupplyCannotBeLessThenTotalMinted(
-                newMaxSupply,
-                _totalMinted()
-            );
-        }
-
-        // Set the new max supply.
-        ERC721ContractMetadataStorage.layout()._maxSupply = newMaxSupply;
-
-        // Emit an event with the update.
-        emit MaxSupplyUpdated(newMaxSupply);
+        _setMaxSupplyInternal(newMaxSupply);
     }
 
     /**
@@ -193,6 +182,26 @@ contract ERC721ContractMetadataUpgradeable is
 
         // Emit an event with the update.
         emit ProvenanceHashUpdated(oldProvenanceHash, newProvenanceHash);
+    }
+
+    function _setMaxSupplyInternal(uint256 newMaxSupply) internal {
+        if (newMaxSupply > 2**64 - 1) {
+            revert CannotExceedMaxSupplyOfUint64(newMaxSupply);
+        }
+
+        if (newMaxSupply < _totalMinted()) {
+            revert NewMaxSupplyCannotBeLessThenTotalMinted(
+                newMaxSupply,
+                _totalMinted()
+            );
+        }
+
+        ERC721ContractMetadataStorage.layout()._maxSupply = newMaxSupply;
+        emit MaxSupplyUpdated(newMaxSupply);
+    }
+
+    function _lockMaxSupply() internal {
+        ERC721ContractMetadataStorage.layout()._maxSupplyLocked = true;
     }
 
     /**
